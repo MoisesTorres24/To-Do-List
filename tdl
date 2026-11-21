@@ -1,0 +1,301 @@
+#!/bin/bash
+
+# Guarda las tareas en la carpeta .tdl del directorio actual.
+LISTA="$(pwd)/.tdl"
+
+# Explica los comandos disponibles.
+ayuda() {
+    cat <<'FIN'
+Uso: tdl comando [argumentos]
+  init                        Crea .tdl en el directorio actual
+  add "nombre"                Agrega actividad
+  ls [-d]                     Lista actividades (-d muestra descripcion)
+  rename N "nombre"           Renombra actividad
+  rm N [N ...]                Elimina una o varias y renumera
+  desc N show|set "texto"|clear
+  item N ls|add "texto"|edit M "texto"|done M|rm M
+  log                         Muestra la bitacora
+  help                        Muestra esta ayuda
+FIN
+}
+
+# Muestra el error y termina sin continuar la operacion.
+error() {
+    echo "Error: $1" >&2
+    exit 1
+}
+
+# Rechaza numeros que no sean indices del 1 al 99.
+numero_valido() {
+    case "$1" in
+        [1-9]|[1-9][0-9]|0[1-9])
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Encuentra una actividad por numero y guarda su ruta en ACTIVIDAD.
+buscar() {
+    local n carpeta
+
+    numero_valido "$1" || return 1
+    n=$(printf '%02d' "$((10#$1))")
+    for carpeta in "$LISTA/${n}_"*; do
+        if [ -d "$carpeta" ]; then
+            ACTIVIDAD="$carpeta"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Comprueba que la lista y su bitacora existan.
+cargar() {
+    [ -d "$LISTA" ] || error 'No existe .tdl aqui; ejecuta tdl init'
+    [ -f "$LISTA/tdl.log" ] || error 'Falta el archivo tdl.log'
+}
+
+# Registra las operaciones que modifican archivos.
+registro() {
+    echo "$1" >> "$LISTA/tdl.log"
+}
+
+# Inicializa la lista en el directorio actual.
+comando_init() {
+    [ "$#" -eq 0 ] || error 'Uso: tdl init'
+    mkdir -p "$LISTA" || error 'No se pudo crear .tdl'
+    touch "$LISTA/tdl.log" || error 'No se pudo crear tdl.log'
+    registro "init: $LISTA"
+    echo "Lista creada en: $LISTA"
+}
+
+# Crea la carpeta y los dos archivos de una actividad.
+comando_add() {
+    local carpeta cantidad=0 n nombre
+
+    [ "$#" -eq 1 ] && [ -n "$1" ] || error 'Uso: tdl add "nombre"'
+    case "$1" in
+        */*|*$'\n'*) error 'Nombre no permitido' ;;
+    esac
+    nombre=$(echo "$1" | tr ' ' '_')
+    for carpeta in "$LISTA"/[0-9][0-9]_*; do
+        [ -d "$carpeta" ] || continue
+        cantidad=$((cantidad + 1))
+    done
+
+    [ "$cantidad" -lt 99 ] || error 'Limite de 99 actividades'
+    n=$(printf '%02d' "$((cantidad + 1))")
+    [ ! -e "$LISTA/${n}_${nombre}" ] || error 'La actividad ya existe'
+    mkdir "$LISTA/${n}_${nombre}" || error 'No se pudo crear la actividad'
+    touch "$LISTA/${n}_${nombre}/descripcion.txt" "$LISTA/${n}_${nombre}/items.txt" || error 'No se pudieron crear los archivos'
+    registro "add: $n $1"
+    echo "Actividad $n creada"
+}
+
+# Muestra el numero y el nombre de cada actividad.
+comando_ls() {
+    local carpeta base n nombre
+
+    [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = '-d' ]; } || error 'Uso: tdl ls [-d]'
+    for carpeta in "$LISTA"/[0-9][0-9]_*; do
+        [ -d "$carpeta" ] || continue
+        base=$(basename "$carpeta")
+        n=$(echo "$base" | cut -d_ -f1)
+        nombre=$(echo "$base" | cut -d_ -f2- | tr '_' ' ')
+        echo "$n - $nombre"
+        if [ "$1" = '-d' ]; then
+            cat "$carpeta/descripcion.txt"
+        fi
+    done
+}
+
+# Cambia el nombre, pero no modifica descripcion ni subtareas.
+comando_rename() {
+    local n nombre
+
+    [ "$#" -eq 2 ] && [ -n "$2" ] || error 'Uso: tdl rename N "nombre"'
+    buscar "$1" || error 'Actividad inexistente'
+    case "$2" in
+        */*|*$'\n'*) error 'Nombre no permitido' ;;
+    esac
+    n=$(basename "$ACTIVIDAD" | cut -d_ -f1)
+    nombre=$(echo "$2" | tr ' ' '_')
+    [ ! -e "$LISTA/${n}_${nombre}" ] || [ "$ACTIVIDAD" = "$LISTA/${n}_${nombre}" ] || error 'Nombre ocupado'
+    mv "$ACTIVIDAD" "$LISTA/${n}_${nombre}" || error 'No se pudo renombrar'
+    registro "rename: $n $2"
+}
+
+# Elimina varias actividades; primero valida todos los numeros.
+comando_rm() {
+    local n carpeta nombre i=1 vistos=" " codigo
+
+    [ "$#" -gt 0 ] || error 'Uso: tdl rm N [N ...]'
+    for n in "$@"; do
+        buscar "$n" || error "No existe la actividad $n"
+        codigo=$(printf '%02d' "$((10#$n))")
+        case "$vistos" in
+            *" $codigo "*) error "Numero repetido: $n" ;;
+        esac
+        vistos="$vistos$codigo "
+    done
+
+    for n in "$@"; do
+        buscar "$n" || error "No existe la actividad $n"
+        rm -rf "$ACTIVIDAD" || error "No se pudo borrar $n"
+        registro "rm: $n"
+    done
+
+    # Los nombres ordenados se recorren de menor a mayor.
+    for carpeta in "$LISTA"/[0-9][0-9]_*; do
+        [ -d "$carpeta" ] || continue
+        nombre=$(basename "$carpeta" | cut -d_ -f2-)
+        n=$(printf '%02d' "$i")
+        [ "$carpeta" = "$LISTA/${n}_${nombre}" ] || mv "$carpeta" "$LISTA/${n}_${nombre}" || error 'No se pudo renumerar'
+        i=$((i + 1))
+    done
+
+    echo 'Actividades eliminadas y renumeradas'
+}
+
+# Consulta, cambia o vacia una descripcion.
+comando_desc() {
+    local n accion archivo
+
+    [ "$#" -ge 2 ] || error 'Uso: tdl desc N show|set "texto"|clear'
+    n="$1"
+    accion="$2"
+    buscar "$n" || error 'Actividad inexistente'
+    archivo="$ACTIVIDAD/descripcion.txt"
+    [ -f "$archivo" ] || error 'Falta descripcion.txt'
+    case "$accion" in
+        show)
+            [ "$#" -eq 2 ] || error 'Sobran argumentos'
+            cat "$archivo"
+            ;;
+        set)
+            [ "$#" -eq 3 ] && [ -n "$3" ] || error 'Falta el texto'
+            echo "$3" > "$archivo" || error 'No se pudo escribir'
+            registro "desc set: $n"
+            ;;
+        clear)
+            [ "$#" -eq 2 ] || error 'Sobran argumentos'
+            echo -n '' > "$archivo" || error 'No se pudo vaciar'
+            registro "desc clear: $n"
+            ;;
+        *)
+            error 'Accion de descripcion desconocida'
+            ;;
+    esac
+}
+
+# Comprueba que la linea de la subtarea exista.
+linea_valida() {
+    local total
+
+    case "$2" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$2" -gt 0 ] 2>/dev/null || return 1
+    total=$(wc -l < "$1")
+    [ "$2" -le "$total" ]
+}
+
+# Administra subtareas; cada linea es 0|texto o 1|texto.
+comando_item() {
+    local n accion archivo i=1 linea texto estado seguro
+
+    [ "$#" -ge 2 ] || error 'Uso: tdl item N accion [argumentos]'
+    n="$1"
+    accion="$2"
+    buscar "$n" || error 'Actividad inexistente'
+    archivo="$ACTIVIDAD/items.txt"
+    [ -f "$archivo" ] || error 'Falta items.txt'
+    case "$accion" in
+        ls)
+            [ "$#" -eq 2 ] || error 'Sobran argumentos'
+            while IFS= read -r linea; do
+                estado=$(echo "$linea" | cut -d'|' -f1)
+                texto=$(echo "$linea" | cut -d'|' -f2-)
+                if [ "$estado" = '1' ]; then
+                    echo "$i. [x] $texto"
+                else
+                    echo "$i. [ ] $texto"
+                fi
+                i=$((i + 1))
+            done < "$archivo"
+            ;;
+        add)
+            [ "$#" -eq 3 ] && [ -n "$3" ] || error 'Falta el texto'
+            case "$3" in
+                *$'\n'*) error 'No se permiten saltos de linea' ;;
+            esac
+            echo "0|$3" >> "$archivo" || error 'No se pudo agregar'
+            registro "item add: $n"
+            ;;
+        edit)
+            [ "$#" -eq 4 ] && [ -n "$4" ] || error 'Uso: tdl item N edit M "texto"'
+            linea_valida "$archivo" "$3" || error 'Subtarea inexistente'
+            case "$4" in
+                *$'\n'*) error 'No se permiten saltos de linea' ;;
+            esac
+            estado=$(head -n "$3" "$archivo" | tail -n 1 | cut -d'|' -f1)
+            # Escapa caracteres especiales antes de editar con sed.
+            seguro=$(printf '%s' "$4" | sed 's/[\&|]/\\&/g')
+            sed -i "${3}s|.*|${estado}\\|${seguro}|" "$archivo" || error 'No se pudo editar'
+            registro "item edit: $n $3"
+            ;;
+        done)
+            [ "$#" -eq 3 ] || error 'Uso: tdl item N done M'
+            linea_valida "$archivo" "$3" || error 'Subtarea inexistente'
+            sed -i "${3}s/^0|/1|/" "$archivo" || error 'No se pudo completar'
+            registro "item done: $n $3"
+            ;;
+        rm)
+            [ "$#" -eq 3 ] || error 'Uso: tdl item N rm M'
+            linea_valida "$archivo" "$3" || error 'Subtarea inexistente'
+            sed -i "${3}d" "$archivo" || error 'No se pudo eliminar'
+            registro "item rm: $n $3"
+            ;;
+        *)
+            error 'Accion de subtarea desconocida'
+            ;;
+    esac
+}
+
+# El primer argumento decide que funcion se ejecuta (como en git).
+comando="$1"
+[ "$#" -gt 0 ] || {
+    ayuda
+    exit 1
+}
+shift
+case "$comando" in
+    help|-h|--help)
+        ayuda
+        ;;
+    init)
+        comando_init "$@"
+        ;;
+    add|ls|rename|rm|desc|item|log)
+        cargar
+        case "$comando" in
+            add) comando_add "$@" ;;
+            ls) comando_ls "$@" ;;
+            rename) comando_rename "$@" ;;
+            rm) comando_rm "$@" ;;
+            desc) comando_desc "$@" ;;
+            item) comando_item "$@" ;;
+            log)
+                [ "$#" -eq 0 ] || error 'Uso: tdl log'
+                cat "$LISTA/tdl.log"
+                ;;
+        esac
+        ;;
+    *)
+        ayuda
+        error "Comando desconocido: $comando"
+        ;;
+esac
